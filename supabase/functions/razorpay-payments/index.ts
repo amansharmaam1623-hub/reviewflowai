@@ -9,6 +9,9 @@ const corsHeaders = {
 
 const RAZORPAY_KEY_ID = Deno.env.get("RAZORPAY_KEY_ID") ?? "";
 const RAZORPAY_KEY_SECRET = Deno.env.get("RAZORPAY_KEY_SECRET") ?? "";
+// Env is snapshotted at deploy time. After `supabase secrets set`, redeploy or
+// the function keeps serving the old value - and `deploy` skips unchanged code,
+// so an unrelated edit is needed to force a new version.
 const RAZORPAY_WEBHOOK_SECRET = Deno.env.get("RAZORPAY_WEBHOOK_SECRET") ?? "";
 
 function json(data: unknown, status = 200) {
@@ -37,9 +40,23 @@ async function razorpayApi(endpoint: string, method: string, body?: unknown) {
   return { ok: res.ok, status: res.status, data };
 }
 
-// Verify subscription payment signature: subscription_id|payment_id
+// Razorpay signs with a lowercase hex digest, not base64.
+function toHex(buf: ArrayBuffer) {
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Constant-time compare so a mismatch doesn't leak the expected signature via timing.
+function safeEqual(a: string, b: string) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// Verify subscription payment signature: payment_id|subscription_id
+// Subscriptions sign payment_id first — the reverse of one-time orders (order_id|payment_id).
 async function verifyPaymentSignature(subscriptionId: string, paymentId: string, signature: string) {
-  const payload = `${subscriptionId}|${paymentId}`;
+  const payload = `${paymentId}|${subscriptionId}`;
   const enc = new TextEncoder().encode(payload);
   const key = await crypto.subtle.importKey(
     "raw",
@@ -49,8 +66,7 @@ async function verifyPaymentSignature(subscriptionId: string, paymentId: string,
     ["sign"],
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc);
-  const expected = btoa(String.fromCharCode(...new Uint8Array(sig)));
-  return expected === signature;
+  return safeEqual(toHex(sig), signature);
 }
 
 async function verifyWebhookSignature(body: string, signature: string) {
@@ -64,8 +80,7 @@ async function verifyWebhookSignature(body: string, signature: string) {
     ["sign"],
   );
   const sig = await crypto.subtle.sign("HMAC", key, enc);
-  const expected = btoa(String.fromCharCode(...new Uint8Array(sig)));
-  return expected === signature;
+  return safeEqual(toHex(sig), signature);
 }
 
 function computePeriodEnd(billingCycle: string, startDate = new Date()): Date {
@@ -325,6 +340,26 @@ Deno.serve(async (req: Request) => {
               .update({ status: "halted", updated_at: new Date().toISOString() })
               .eq("id", localSub.id);
           }
+        }
+        return json({ received: true });
+      }
+
+      // ── subscription.halted / subscription.completed ──
+      // halted: Razorpay exhausted its retries on a renewal - the customer has
+      // stopped paying. completed: the subscription ran its full term. Both must
+      // downgrade even an *active* sub, unlike paused/pending above, or the user
+      // keeps access indefinitely. No 'completed' in the status CHECK, so both
+      // land on 'halted'/'expired' respectively.
+      if (eventType === "subscription.halted" || eventType === "subscription.completed") {
+        const subId = subscriptionEntity?.id;
+        const localSub = subId ? await findSubByRzpId(subId) : null;
+        if (localSub) {
+          await supabaseAdmin.from("subscriptions")
+            .update({
+              status: eventType === "subscription.halted" ? "halted" : "expired",
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", localSub.id);
         }
         return json({ received: true });
       }
