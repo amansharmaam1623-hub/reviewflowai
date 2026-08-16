@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useState, useCallback, useMemo, useRef, type ReactNode } from 'react';
 import type { Session, User } from '@supabase/supabase-js';
 import { supabase, type Profile, type UserRole } from '@/lib/supabase';
 
@@ -26,6 +26,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
+  const userIdRef = useRef<string | null>(null);
 
   const fetchProfile = useCallback(async (uid: string) => {
     const { data, error } = await supabase
@@ -42,6 +43,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
+      userIdRef.current = data.session?.user?.id ?? null;
       setSession(data.session);
       setUser(data.session?.user ?? null);
       if (data.session?.user) {
@@ -53,11 +55,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
       setSession(newSession);
+
+      // TOKEN_REFRESHED fires on every tab focus and on the autoRefresh timer,
+      // handing back a brand-new User object for the same person. Publishing it
+      // changed the identity of `user`, which re-created every useCallback keyed
+      // on it, re-ran the fetch effects, and flipped useSubscription().loading
+      // back to true - at which point ProtectedRoute swapped <Outlet /> for a
+      // spinner and unmounted the whole page, wiping half-filled forms. Only
+      // publish when the signed-in user actually changes.
+      const nextUserId = newSession?.user?.id ?? null;
+      if (nextUserId === userIdRef.current) return;
+      userIdRef.current = nextUserId;
+
       setUser(newSession?.user ?? null);
       if (newSession?.user) {
-        (async () => {
-          await fetchProfile(newSession.user.id);
-        })();
+        void fetchProfile(newSession.user.id);
       } else {
         setProfile(null);
       }
@@ -104,6 +116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback(async () => {
     await supabase.auth.signOut();
+    userIdRef.current = null; // keep in sync or signing back in as the same user is ignored
     setProfile(null);
     setSession(null);
     setUser(null);
@@ -133,28 +146,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const emailVerified = user?.email_confirmed_at != null || user?.app_metadata?.provider === 'google';
 
-  return (
-    <AuthContext.Provider
-      value={{
-        session,
-        user,
-        profile,
-        role: profile?.role ?? null,
-        loading,
-        emailVerified,
-        signIn,
-        signUp,
-        signInWithGoogle,
-        signOut,
-        resetPassword,
-        resendVerification,
-        refreshProfile,
-        completeOnboarding,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const value = useMemo<AuthContextValue>(
+    () => ({
+      session,
+      user,
+      profile,
+      role: profile?.role ?? null,
+      loading,
+      emailVerified,
+      signIn,
+      signUp,
+      signInWithGoogle,
+      signOut,
+      resetPassword,
+      resendVerification,
+      refreshProfile,
+      completeOnboarding,
+    }),
+    [session, user, profile, loading, emailVerified, signIn, signUp, signInWithGoogle,
+     signOut, resetPassword, resendVerification, refreshProfile, completeOnboarding],
   );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
