@@ -2,6 +2,25 @@ import { useEffect, useState, useCallback } from 'react';
 import { supabase, type Business, type Review, type QrCode, type Subscription, type Package, type Profile, type Payment, type Feedback } from '@/lib/supabase';
 import { useAuth } from '@/lib/auth';
 
+// `loading` means "the first fetch for this query is still in flight", not "a
+// fetch is in flight". Background refetches - realtime events, a manual refetch
+// after a save - must not flip it back to true: callers render skeletons on it,
+// and ProtectedRoute unmounts the entire page tree on it. Hence setLoading(true)
+// lives in the effect (which only re-runs when the query itself changes), never
+// inside refetch().
+
+/**
+ * Collapses an id list to a stable string so the hooks below key on its
+ * *contents*, not its array identity. Callers routinely build the list inline
+ * (`businesses.map(b => b.id)`), handing over a fresh array every render; keyed
+ * on identity that re-creates refetch, re-runs the effect, sets state, and
+ * renders again - an infinite loop, and a realtime channel torn down and
+ * re-subscribed on every pass. Keying on contents makes a caller's useMemo an
+ * optimisation rather than a correctness requirement.
+ */
+const idKey = (ids: string[]) => ids.join(',');
+const splitIdKey = (key: string) => (key ? key.split(',') : []);
+
 export function useBusinesses() {
   const { user } = useAuth();
   const [businesses, setBusinesses] = useState<Business[]>([]);
@@ -13,7 +32,6 @@ export function useBusinesses() {
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('businesses')
       .select('*')
@@ -23,40 +41,41 @@ export function useBusinesses() {
     setLoading(false);
   }, [user]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
   return { businesses, loading, refetch };
 }
 
 export function useReviews(businessIds: string[]) {
   const [reviews, setReviews] = useState<Review[]>([]);
   const [loading, setLoading] = useState(true);
+  const key = idKey(businessIds);
 
   const refetch = useCallback(async () => {
-    if (businessIds.length === 0) {
+    const ids = splitIdKey(key);
+    if (ids.length === 0) {
       setReviews([]);
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('reviews')
       .select('*')
-      .in('business_id', businessIds)
+      .in('business_id', ids)
       .order('created_at', { ascending: false });
     setReviews((data as Review[]) ?? []);
     setLoading(false);
-  }, [businessIds]);
+  }, [key]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
 
   useEffect(() => {
-    if (businessIds.length === 0) return;
+    if (!key) return;
     const channel = supabase
-      .channel(`reviews-realtime-${businessIds.join('-')}`)
+      .channel(`reviews-realtime-${key}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'reviews' }, () => refetch())
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [businessIds, refetch]);
+  }, [key, refetch]);
 
   return { reviews, loading, refetch };
 }
@@ -64,33 +83,34 @@ export function useReviews(businessIds: string[]) {
 export function useQrCodes(businessIds: string[]) {
   const [qrCodes, setQrCodes] = useState<QrCode[]>([]);
   const [loading, setLoading] = useState(true);
+  const key = idKey(businessIds);
 
   const refetch = useCallback(async () => {
-    if (businessIds.length === 0) {
+    const ids = splitIdKey(key);
+    if (ids.length === 0) {
       setQrCodes([]);
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('qr_codes')
       .select('*')
-      .in('business_id', businessIds)
+      .in('business_id', ids)
       .order('created_at', { ascending: false });
     setQrCodes((data as QrCode[]) ?? []);
     setLoading(false);
-  }, [businessIds]);
+  }, [key]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
 
   useEffect(() => {
-    if (businessIds.length === 0) return;
+    if (!key) return;
     const channel = supabase
-      .channel(`qr-realtime-${businessIds.join('-')}`)
+      .channel(`qr-realtime-${key}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'qr_codes' }, () => refetch())
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [businessIds, refetch]);
+  }, [key, refetch]);
 
   return { qrCodes, loading, refetch };
 }
@@ -111,7 +131,6 @@ export function useSubscription() {
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('subscriptions')
       .select('*, package:packages(id, name, slug, business_limit, review_limit, price_monthly, price_yearly)')
@@ -122,7 +141,7 @@ export function useSubscription() {
     setLoading(false);
   }, [user]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
 
   useEffect(() => {
     if (!user) return;
@@ -147,7 +166,6 @@ export function usePayments() {
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('payments')
       .select('*')
@@ -157,7 +175,7 @@ export function usePayments() {
     setLoading(false);
   }, [user]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
   return { payments, loading, refetch };
 }
 
@@ -254,33 +272,34 @@ export function useAllPayments() {
 export function useFeedback(businessIds: string[]) {
   const [feedback, setFeedback] = useState<Feedback[]>([]);
   const [loading, setLoading] = useState(true);
+  const key = idKey(businessIds);
 
   const refetch = useCallback(async () => {
-    if (businessIds.length === 0) {
+    const ids = splitIdKey(key);
+    if (ids.length === 0) {
       setFeedback([]);
       setLoading(false);
       return;
     }
-    setLoading(true);
     const { data } = await supabase
       .from('feedback')
       .select('*')
-      .in('business_id', businessIds)
+      .in('business_id', ids)
       .order('created_at', { ascending: false });
     setFeedback((data as Feedback[]) ?? []);
     setLoading(false);
-  }, [businessIds]);
+  }, [key]);
 
-  useEffect(() => { refetch(); }, [refetch]);
+  useEffect(() => { setLoading(true); refetch(); }, [refetch]);
 
   useEffect(() => {
-    if (businessIds.length === 0) return;
+    if (!key) return;
     const channel = supabase
-      .channel(`feedback-realtime-${businessIds.join('-')}`)
+      .channel(`feedback-realtime-${key}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'feedback' }, () => refetch())
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [businessIds, refetch]);
+  }, [key, refetch]);
 
   return { feedback, loading, refetch };
 }

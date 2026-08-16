@@ -46,35 +46,54 @@ export function RealQRCode({ value, color = '#202124', size = 320, className = '
   );
 }
 
-export function downloadQrPng(value: string, color: string, filename: string) {
-  QRCode.toDataURL(value, {
-    width: 512,
+export const QR_EXPORT_SIZE = 512;
+
+/**
+ * Both export formats go through here so they cannot drift apart again.
+ * The anchor must be in the document - a detached one is a no-op in Firefox -
+ * and the object URL must outlive the click, or the browser cancels the
+ * download before it has finished reading the blob.
+ */
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+const withExt = (filename: string, ext: string) =>
+  filename.endsWith(`.${ext}`) ? filename : `${filename}.${ext}`;
+
+export async function downloadQrPng(value: string, color: string, filename: string) {
+  const canvas = document.createElement('canvas');
+  await QRCode.toCanvas(canvas, value, {
+    width: QR_EXPORT_SIZE,
     margin: 2,
     color: { dark: color, light: '#FFFFFF' },
     errorCorrectionLevel: 'M',
-  }, (err: Error | null | undefined, url: string) => {
-    if (err || !url) return;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename.endsWith('.png') ? filename : `${filename}.png`;
-    a.click();
+  });
+  await new Promise<void>((resolve) => {
+    canvas.toBlob((blob) => {
+      if (blob) saveBlob(blob, withExt(filename, 'png'));
+      resolve();
+    }, 'image/png');
   });
 }
 
-export function downloadQrSvg(value: string, color: string, filename: string) {
-  QRCode.toString(value, {
+export async function downloadQrSvg(value: string, color: string, filename: string) {
+  const svg = await QRCode.toString(value, {
     type: 'svg',
+    // Without an explicit width the renderer emits a viewBox and no intrinsic
+    // size, so the file lands as a ~29px stamp anywhere that is not a browser.
+    width: QR_EXPORT_SIZE,
     margin: 2,
     color: { dark: color, light: '#FFFFFF' },
     errorCorrectionLevel: 'M',
-  }, (err: Error | null | undefined, svg: string) => {
-    if (err || !svg) return;
-    const blob = new Blob([svg], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename.endsWith('.svg') ? filename : `${filename}.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
   });
+  saveBlob(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }), withExt(filename, 'svg'));
 }
