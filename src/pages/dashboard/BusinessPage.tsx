@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import { Building2, Phone, Star, QrCode, Check, Tag, Search, Lock, AlertCircle, Plus, Pencil, Trash2 } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Building2, Phone, Star, QrCode, Check, Tag, Search, Lock, AlertCircle, Plus, Pencil, Trash2, MapPin, Loader2, ArrowRight, X } from 'lucide-react';
 import { Topbar } from '@/components/dashboard/Topbar';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
@@ -17,11 +17,32 @@ interface FormState {
   category: string;
   google_business_url: string;
   phone: string;
+  address: string;
+  website: string;
 }
 
 const emptyForm: FormState = {
-  name: '', category: '', google_business_url: '', phone: '',
+  name: '', category: '', google_business_url: '', phone: '', address: '', website: '',
 };
+
+interface BusinessSuggestion {
+  placeId: string;
+  name: string;
+  address: string;
+  fullDescription: string;
+}
+
+interface PlaceDetails {
+  name: string;
+  address: string;
+  phone: string;
+  website: string;
+  mapsUrl: string;
+  reviewUrl: string;
+  category: string;
+  rating: number | null;
+  ratingCount: number | null;
+}
 
 export function BusinessPage() {
   const { user } = useAuth();
@@ -31,6 +52,7 @@ export function BusinessPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [keywords, setKeywords] = useState<string[]>(['', '', '', '', '']);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [placeId, setPlaceId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,37 +60,147 @@ export function BusinessPage() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
+  // Google Places search state (only used when adding a new business)
+  const [placeSearch, setPlaceSearch] = useState('');
+  const [suggestions, setSuggestions] = useState<BusinessSuggestion[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [fetchingDetails, setFetchingDetails] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchWrapRef = useRef<HTMLDivElement | null>(null);
+
   const planLabel = access.plan.charAt(0).toUpperCase() + access.plan.slice(1);
   const atLimit = access.businessLimit !== -1 && businesses.length >= access.businessLimit;
   const limitLabel = access.businessLimit === -1 ? 'Unlimited' : String(access.businessLimit);
 
   const selectBusiness = (b: Business) => {
     setEditingId(b.id);
+    setPlaceId(b.google_place_id ?? null);
     setForm({
       name: b.name || '',
       category: b.category || '',
       google_business_url: b.google_business_url || '',
       phone: b.phone || '',
+      address: b.address || '',
+      website: b.website || '',
     });
     const kw = b.seo_keywords ?? [];
     setKeywords([kw[0] ?? '', kw[1] ?? '', kw[2] ?? '', kw[3] ?? '', kw[4] ?? '']);
     setError(null);
     setLimitError(null);
     setSaved(false);
+    setShowSearch(false);
+    setPlaceSearch('');
+    setSuggestions([]);
+    setSearchError(null);
   };
 
   const startNew = () => {
     setEditingId(null);
+    setPlaceId(null);
     setForm(emptyForm);
     setKeywords(['', '', '', '', '']);
     setError(null);
     setLimitError(null);
     setSaved(false);
+    setShowSearch(true);
+    setPlaceSearch('');
+    setSuggestions([]);
+    setSearchError(null);
+  };
+
+  // Debounced Google Places autocomplete search
+  useEffect(() => {
+    if (!showSearch) return;
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (placeSearch.length < 2) {
+      setSuggestions([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    setSearchError(null);
+    searchTimer.current = setTimeout(async () => {
+      try {
+        const { data, error: rpcError } = await supabase.functions.invoke('google-places', {
+          body: { action: 'autocomplete', input: placeSearch },
+        });
+        if (rpcError) {
+          setSuggestions([]);
+          setSearchError((rpcError as Error).message || 'Search failed. Please try again.');
+        } else if (data?.error) {
+          setSuggestions([]);
+          setSearchError(data.error);
+        } else if (!data?.suggestions) {
+          setSuggestions([]);
+          setSearchError('Unexpected response from the server.');
+        } else {
+          setSuggestions(data.suggestions);
+        }
+      } catch (err) {
+        setSuggestions([]);
+        setSearchError(err instanceof Error ? err.message : 'Network error. Please try again.');
+      } finally {
+        setSearching(false);
+      }
+    }, 350);
+    return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
+  }, [placeSearch, showSearch]);
+
+  // Close suggestions when clicking outside the search box
+  useEffect(() => {
+    if (!showSearch) return;
+    const handler = (e: MouseEvent) => {
+      if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
+        setSuggestions([]);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showSearch]);
+
+  const selectPlace = async (suggestion: BusinessSuggestion) => {
+    setFetchingDetails(true);
+    setSuggestions([]);
+    setPlaceSearch('');
+    setShowSearch(false);
+    setError(null);
+    try {
+      const { data, error: rpcError } = await supabase.functions.invoke('google-places', {
+        body: { action: 'details', placeId: suggestion.placeId },
+      });
+      if (rpcError) throw new Error((rpcError as Error).message || 'Failed to fetch business details.');
+      if (data?.error) throw new Error(data.error);
+      const d = data as PlaceDetails;
+      setPlaceId(suggestion.placeId);
+      setForm({
+        name: d.name || suggestion.name,
+        category: d.category || '',
+        google_business_url: d.mapsUrl || d.reviewUrl || '',
+        phone: d.phone || '',
+        address: d.address || suggestion.address,
+        website: d.website || '',
+      });
+    } catch {
+      // Fallback to suggestion data
+      setPlaceId(suggestion.placeId);
+      setForm({
+        name: suggestion.name,
+        category: '',
+        google_business_url: `https://search.google.com/local/writereview?placeid=${suggestion.placeId}`,
+        phone: '',
+        address: suggestion.address,
+        website: '',
+      });
+    } finally {
+      setFetchingDetails(false);
+    }
   };
 
   // Auto-select first business on initial load if no selection
   useEffect(() => {
-    if (!loading && businesses.length > 0 && !editingId && !saved) {
+    if (!loading && businesses.length > 0 && !editingId && !saved && !showSearch) {
       selectBusiness(businesses[0]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -103,6 +235,9 @@ export function BusinessPage() {
       category: form.category.trim() || null,
       google_business_url: form.google_business_url.trim() || null,
       phone: form.phone.trim() || null,
+      address: form.address.trim() || null,
+      website: form.website.trim() || null,
+      google_place_id: placeId,
       seo_keywords: cleanKeywords,
     };
 
@@ -123,6 +258,7 @@ export function BusinessPage() {
         if (data) setEditingId(data.id);
       }
       setSaved(true);
+      setShowSearch(false);
       setTimeout(() => setSaved(false), 2500);
       await refetch();
     } catch (err) {
@@ -243,11 +379,96 @@ export function BusinessPage() {
               </h3>
             </div>
 
+            {/* Google Places search (only when adding a new business) */}
+            <AnimatePresence>
+              {showSearch && !editingId && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div ref={searchWrapRef} className="mb-5 rounded-xl bg-gradient-to-br from-google-blue/5 to-google-green/5 border border-google-blue/20 p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <Search className="h-4 w-4 text-google-blue" />
+                        <span className="text-sm font-semibold text-ink-800">Search Google for your business</span>
+                      </div>
+                      <button
+                        onClick={() => { setShowSearch(false); setPlaceSearch(''); setSuggestions([]); }}
+                        className="p-1 rounded-lg text-ink-400 hover:bg-ink-100 hover:text-ink-600 transition-colors"
+                        title="Close search"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="relative">
+                      <Search className={`absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 transition-colors ${searching ? 'text-google-blue' : 'text-ink-400'}`} />
+                      <input
+                        value={placeSearch}
+                        onChange={(e) => setPlaceSearch(e.target.value)}
+                        placeholder="Type your business name…"
+                        autoFocus
+                        className="w-full h-11 pl-10 pr-10 rounded-xl bg-white border border-ink-200 text-sm text-ink-800 outline-none focus:border-google-blue transition-colors placeholder:text-ink-400"
+                      />
+                      {searching && (
+                        <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 text-google-blue animate-spin" />
+                      )}
+                    </div>
+
+                    {/* Suggestions dropdown */}
+                    {suggestions.length > 0 && (
+                      <div className="mt-2 space-y-1.5 max-h-64 overflow-y-auto">
+                        {suggestions.map((s) => (
+                          <button
+                            key={s.placeId}
+                            onClick={() => selectPlace(s)}
+                            className="w-full text-left rounded-lg bg-white border border-ink-200 hover:border-google-blue hover:shadow-sm p-3 transition-all group"
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <div className="h-8 w-8 rounded-lg bg-google-blue/10 flex items-center justify-center shrink-0 group-hover:bg-google-blue/20 transition-colors">
+                                <Building2 className="h-4 w-4 text-google-blue" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm font-semibold text-ink-800 truncate">{s.name}</p>
+                                <p className="text-xs text-ink-500 truncate">{s.address}</p>
+                              </div>
+                              <ArrowRight className="h-3.5 w-3.5 text-ink-300 group-hover:text-google-blue transition-colors shrink-0" />
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {placeSearch.length >= 2 && !searching && suggestions.length === 0 && !searchError && (
+                      <p className="text-xs text-ink-400 mt-2 text-center">No businesses found. Try a different search, or fill in the details manually below.</p>
+                    )}
+
+                    {searchError && !searching && (
+                      <p className="text-xs text-google-red mt-2">{searchError}</p>
+                    )}
+
+                    {fetchingDetails && (
+                      <div className="flex items-center gap-2 mt-3 text-sm text-ink-500">
+                        <Loader2 className="h-4 w-4 text-google-blue animate-spin" />
+                        Fetching business details from Google…
+                      </div>
+                    )}
+
+                    <p className="text-[11px] text-ink-400 mt-3">
+                      Selecting a business auto-fills the form below. You can edit anything before saving.
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             <div className="grid sm:grid-cols-2 gap-4">
               <Field icon={Building2} label="Business Name" placeholder="Bella's Bistro" value={form.name} onChange={(v) => setForm({ ...form, name: v })} />
               <Field icon={Tag} label="Business Category" placeholder="Italian Restaurant" value={form.category} onChange={(v) => setForm({ ...form, category: v })} />
               <Field icon={Star} label="Google Review Link" placeholder="google.com/review/…" value={form.google_business_url} onChange={(v) => setForm({ ...form, google_business_url: v })} />
               <Field icon={Phone} label="Phone Number" placeholder="(555) 123-4567" value={form.phone} onChange={(v) => setForm({ ...form, phone: v })} />
+              <Field icon={MapPin} label="Address" placeholder="123 Main St, City, State" value={form.address} onChange={(v) => setForm({ ...form, address: v })} />
             </div>
 
             {/* SEO Keywords Section */}
@@ -316,6 +537,7 @@ export function BusinessPage() {
               </div>
               <div className="space-y-1.5 text-xs text-ink-500">
                 <div className="flex items-center gap-1.5"><Phone className="h-3 w-3" /> {form.phone || 'No phone set'}</div>
+                <div className="flex items-center gap-1.5"><MapPin className="h-3 w-3" /> {form.address || 'No address set'}</div>
                 <div className="flex items-center gap-1.5"><Star className="h-3 w-3" /> {form.google_business_url ? 'Review link set' : 'No review link'}</div>
               </div>
               {keywords.some((k) => k.trim()) && (
